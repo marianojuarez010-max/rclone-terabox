@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Log in to TeraBox by scanning a QR code with the TeraBox phone app,
+then store the session in rclone's config and verify it with `rclone about`.
+
+Only the Python standard library is required. OpenCV and qrencode, when
+present, let the code print inside the terminal; otherwise the PNG is
+opened with the desktop's image viewer.
+"""
+
+import argparse
+import base64
+import http.cookiejar
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+)
+LOGIN_PAGE = "https://www.1024terabox.com/ai/index"
+PENDING_CODE = 39
+STEP_WAITING_FOR_SCAN = 0
+STEP_WAITING_FOR_CONFIRM = 1
+
+
+class Session:
+    def __init__(self, lang):
+        self.lang = lang
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar)
+        )
+
+    def _accept_language(self):
+        return "en-US,en;q=0.9" if self.lang == "en" else f"{self.lang},en;q=0.9"
+
+    def get_page(self, url):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": self._accept_language(),
+            },
+        )
+        with self.opener.open(request, timeout=35) as response:
+            return response.geturl(), response.read().decode("utf-8", "replace")
+
+    def post_json(self, origin, path, referer, form):
+        url = f"{origin}{path}?t={int(time.time() * 1000)}"
+        request = urllib.request.Request(
+            url,
+            data=urllib.parse.urlencode(form).encode(),
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": self._accept_language(),
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": origin,
+                "Referer": referer,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        with self.opener.open(request, timeout=35) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+
+    def cookie(self, name):
+        for cookie in self.jar:
+            if cookie.name == name:
+                return cookie.value
+        return None
+
+
+def start(session, login_page):
+    page_url, html = session.get_page(login_page)
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(page_url))
+    browser_id = session.cookie("browserid")
+    if not browser_id:
+        sys.exit(f"TeraBox did not set a browserid cookie on {page_url}")
+    match = re.search(r'"pcftoken":"([^"]+)"', html)
+    if not match:
+        sys.exit(f"pcftoken not found in {page_url}")
+    form = {
+        "browserid": browser_id,
+        "client": "web",
+        "clientfrom": "h5",
+        "lang": session.lang,
+        "pass_version": "2.8",
+        "pcftoken": match.group(1),
+    }
+    reply = session.post_json(origin, "/passport/qrcode/get", page_url, form)
+    code = reply.get("code", reply.get("errno"))
+    data = reply.get("data") or {}
+    if code != 0 or not all(k in data for k in ("uuid", "qrcode", "seq")):
+        sys.exit(f"QR request failed: {json.dumps(reply)[:300]}")
+    png = base64.b64decode(data["qrcode"].split(",", 1)[1])
+    state = dict(form, reg_source="web", seq=data["seq"], uuid=data["uuid"],
+                 step=STEP_WAITING_FOR_SCAN)
+    return origin, page_url, state, png
+
+
+def decode_qr(png):
+    try:
+        import cv2
+        import numpy
+    except ImportError:
+        return None
+    image = cv2.imdecode(numpy.frombuffer(png, numpy.uint8), cv2.IMREAD_COLOR)
+    text, _, _ = cv2.QRCodeDetector().detectAndDecode(image)
+    return text or None
+
+
+def show_qr(png):
+    path = os.path.join(tempfile.mkdtemp(prefix="terabox-login-"), "qr.png")
+    with open(path, "wb") as handle:
+        handle.write(png)
+    text = decode_qr(png)
+    if text and shutil.which("qrencode"):
+        subprocess.run(["qrencode", "-t", "UTF8", "-m", "2", text], check=False)
+    if shutil.which("xdg-open") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    print(f"QR code saved to {path}")
+
+
+def poll(session, origin, page_url, state, timeout):
+    deadline = time.time() + timeout
+    announced_scan = False
+    while time.time() < deadline:
+        reply = session.post_json(origin, "/passport/qrcode/login", page_url, state)
+        code = reply.get("code", reply.get("errno"))
+        data = reply.get("data") or {}
+        if code == 0:
+            for key in ("v", "vcode"):
+                if reply.get(key) or data.get(key):
+                    state["v"] = reply.get(key) or data.get(key)
+            ndus = data.get("ndus") or session.cookie("ndus")
+            if ndus:
+                return ndus, data.get("uname") or ""
+            if state["step"] == STEP_WAITING_FOR_SCAN:
+                state["step"] = STEP_WAITING_FOR_CONFIRM
+        elif code != PENDING_CODE:
+            sys.exit(f"QR login failed: {json.dumps(reply)[:300]}")
+        if state["step"] == STEP_WAITING_FOR_CONFIRM and not announced_scan:
+            print("Scanned. Confirm the login in the TeraBox app.")
+            announced_scan = True
+        time.sleep(2)
+    sys.exit("No scan within the time limit; the code has expired. Run again.")
+
+
+def find_rclone(explicit):
+    if explicit:
+        return explicit
+    sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rclone")
+    if os.access(sibling, os.X_OK):
+        return sibling
+    found = shutil.which("rclone")
+    if not found:
+        sys.exit("rclone not found; build it with build.sh or pass --rclone")
+    return found
+
+
+def store(rclone, remote, ndus, domain):
+    remotes = subprocess.run([rclone, "listremotes"], capture_output=True,
+                             text=True, check=True).stdout.split()
+    settings = [f"cookie={ndus}", f"domain={domain}"]
+    if f"{remote}:" in remotes:
+        command = [rclone, "config", "update", remote, *settings]
+    else:
+        command = [rclone, "config", "create", remote, "terabox", *settings]
+    subprocess.run([*command, "--non-interactive"], check=True,
+                   stdout=subprocess.DEVNULL)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--remote", default="terabox",
+                        help="rclone remote name to create or update (default: terabox)")
+    parser.add_argument("--rclone", help="rclone binary (default: bin/rclone beside this script, else PATH)")
+    parser.add_argument("--domain", default="https://www.nephobox.com",
+                        help="TeraBox API domain stored in the remote (default: %(default)s)")
+    parser.add_argument("--login-page", default=LOGIN_PAGE,
+                        help="page that issues the QR code (default: %(default)s)")
+    parser.add_argument("--lang", default="en")
+    parser.add_argument("--timeout", type=int, default=180,
+                        help="seconds to wait for the scan (default: %(default)s)")
+    args = parser.parse_args()
+
+    rclone = find_rclone(args.rclone)
+    session = Session(args.lang)
+    origin, page_url, state, png = start(session, args.login_page)
+    show_qr(png)
+    print("Scan the code with the TeraBox app: Me > scan icon (top right).")
+    ndus, name = poll(session, origin, page_url, state, args.timeout)
+    store(rclone, args.remote, ndus, args.domain)
+    print(f"Logged in{' as ' + name if name else ''}; remote '{args.remote}:' saved.")
+    about = subprocess.run([rclone, "about", f"{args.remote}:"], capture_output=True, text=True)
+    print(about.stdout or about.stderr)
+    sys.exit(about.returncode)
+
+
+if __name__ == "__main__":
+    main()
