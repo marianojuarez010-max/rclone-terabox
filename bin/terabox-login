@@ -198,7 +198,7 @@ def main():
     session = Session(args.lang)
     origin, page_url, state, png = start(session, args.login_page)
     show_qr(png)
-    print("Scan the code with the TeraBox app: Me > scan icon (top right).")
+    print("Scan the code with the TeraBox app on your phone, then confirm there.")
     ndus, name = poll(session, origin, page_url, state, args.timeout)
     store(rclone, args.remote, ndus, args.domain)
     print(f"Logged in{' as ' + name if name else ''}; remote '{args.remote}:' saved.")
